@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import logging
@@ -5,6 +6,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import quote_plus
 
 import httpx
 import pandas as pd
@@ -24,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     select,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -33,6 +36,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 DATABASE_URL = "postgresql+asyncpg://mf_user:mf_password@localhost:5432/mf_analytics"
 REDIS_URL = "redis://localhost:6379"
 MFAPI_BASE_URL = "https://api.mfapi.in/mf"
+MFAPI_SEARCH_URL = "https://api.mfapi.in/mf/search"
+MFAPI_PAGE_SIZE = 200
 WINDOWS: Dict[str, int] = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10}
 TARGET_AMCS = ["ICICI Prudential", "HDFC", "Axis", "SBI", "Kotak Mahindra"]
 TARGET_CATEGORIES = {
@@ -95,7 +100,7 @@ class FundSyncState(Base):
     last_analytics_at = Column(DateTime(timezone=True), nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
     last_error = Column(String, nullable=True)
-    last_job_id = Column(Integer, nullable=True, index=True)
+    last_job_id = Column(Integer, ForeignKey("sync_jobs.id"), nullable=True, index=True)
 
 
 class SyncJob(Base):
@@ -285,6 +290,10 @@ def round2(v: float) -> float:
     return round(float(v), 2)
 
 
+def parse_ddmmyyyy(date_str: str) -> date:
+    return datetime.strptime(date_str, "%d-%m-%Y").date()
+
+
 def nearest_nav_on_or_before(df: pd.DataFrame, target_date: date) -> Optional[Tuple[date, float]]:
     eligible = df[df.index <= pd.Timestamp(target_date)]
     if eligible.empty:
@@ -437,6 +446,37 @@ def verified_target_key(meta: MfapiSchemeMeta) -> Optional[Tuple[str, str]]:
     return amc, category
 
 
+def extract_list_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "results", "items", "schemes"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def extract_paged_items(payload: Any) -> Tuple[List[Dict[str, Any]], bool]:
+    items = extract_list_items(payload)
+    has_more = False
+    if isinstance(payload, dict):
+        for key in ("hasMore", "has_more", "nextPage", "next_page", "next"):
+            value = payload.get(key)
+            if isinstance(value, bool):
+                has_more = value
+                break
+            if value not in (None, "", False):
+                has_more = True
+                break
+        total = payload.get("total") or payload.get("count")
+        offset = payload.get("offset")
+        limit = payload.get("limit")
+        if isinstance(total, int) and isinstance(offset, int) and isinstance(limit, int):
+            has_more = (offset + limit) < total
+    return items, has_more
+
+
 # --- DISCOVERY ENGINE ---
 async def fetch_scheme_history(client: httpx.AsyncClient, code: int) -> MfapiNAVHistoryResponse:
     data_raw = await mfapi_get_json(client, f"{MFAPI_BASE_URL}/{code}")
@@ -446,27 +486,93 @@ async def fetch_scheme_history(client: httpx.AsyncClient, code: int) -> MfapiNAV
     return data
 
 
+async def search_candidates_for_amc(client: httpx.AsyncClient, amc: str) -> List[MfapiSchemeSearchResult]:
+    url = f"{MFAPI_SEARCH_URL}?q={quote_plus(amc)}"
+    payload = await mfapi_get_json(client, url)
+    items = extract_list_items(payload)
+    return [MfapiSchemeSearchResult.model_validate(item) for item in items if "schemeCode" in item and "schemeName" in item]
+
+
+async def iter_master_list_pages(client: httpx.AsyncClient) -> List[MfapiSchemeSearchResult]:
+    offset = 0
+    all_items: List[MfapiSchemeSearchResult] = []
+    seen_codes: set[int] = set()
+
+    while True:
+        url = f"{MFAPI_BASE_URL}?limit={MFAPI_PAGE_SIZE}&offset={offset}"
+        payload = await mfapi_get_json(client, url)
+        items, has_more = extract_paged_items(payload)
+
+        if not items and offset == 0:
+            payload = await mfapi_get_json(client, MFAPI_BASE_URL)
+            items = extract_list_items(payload)
+            has_more = False
+
+        if not items:
+            break
+
+        parsed = [
+            MfapiSchemeSearchResult.model_validate(item)
+            for item in items
+            if "schemeCode" in item and "schemeName" in item
+        ]
+        new_count = 0
+        for item in parsed:
+            if item.schemeCode not in seen_codes:
+                seen_codes.add(item.schemeCode)
+                all_items.append(item)
+                new_count += 1
+
+        if not has_more or new_count == 0 or len(items) < MFAPI_PAGE_SIZE:
+            break
+        offset += MFAPI_PAGE_SIZE
+
+    return all_items
+
+
 async def discover_schemes(client: httpx.AsyncClient) -> List[int]:
     logger.info("Starting validated scheme discovery")
-    master_list_raw = await mfapi_get_json(client, MFAPI_BASE_URL)
-    master_list = [MfapiSchemeSearchResult.model_validate(item) for item in master_list_raw]
 
-    candidates: Dict[Tuple[str, str], List[MfapiSchemeSearchResult]] = {}
+    candidates: Dict[Tuple[str, str], List[MfapiSchemeSearchResult]] = {
+        (amc, category): [] for amc in TARGET_AMCS for category in TARGET_CATEGORIES
+    }
+    seen_codes: set[int] = set()
+
+    # Fast path: targeted AMC searches to avoid scanning the whole catalog during normal bootstrap.
     for amc in TARGET_AMCS:
-        for category in TARGET_CATEGORIES:
-            candidates[(amc, category)] = []
+        try:
+            items = await search_candidates_for_amc(client, amc)
+        except Exception:
+            logger.exception("AMC search failed for %s; falling back to catalog scan", amc)
+            items = []
+        for item in items:
+            if item.schemeCode in seen_codes:
+                continue
+            seen_codes.add(item.schemeCode)
+            if not is_direct_growth_scheme(item.schemeName):
+                continue
+            matched_amc = match_target_amc(item.schemeName.upper()) or amc
+            category = normalize_assignment_category(None, item.schemeName)
+            if matched_amc in TARGET_AMCS and category in TARGET_CATEGORIES:
+                candidates[(matched_amc, category)].append(item)
 
-    for item in master_list:
-        if not is_direct_growth_scheme(item.schemeName):
-            continue
-        amc = match_target_amc(item.schemeName.upper())
-        category = normalize_assignment_category(None, item.schemeName)
-        if amc and category:
-            candidates[(amc, category)].append(item)
+    missing_buckets = [key for key, bucket in candidates.items() if not bucket]
+    if missing_buckets:
+        logger.info("Search discovery incomplete; scanning paginated master list for %s missing buckets", len(missing_buckets))
+        master_list = await iter_master_list_pages(client)
+        for item in master_list:
+            if item.schemeCode in seen_codes:
+                continue
+            if not is_direct_growth_scheme(item.schemeName):
+                continue
+            matched_amc = match_target_amc(item.schemeName.upper())
+            category = normalize_assignment_category(None, item.schemeName)
+            if matched_amc and category and (matched_amc, category) in candidates:
+                candidates[(matched_amc, category)].append(item)
+                seen_codes.add(item.schemeCode)
 
     discovered: Dict[Tuple[str, str], int] = {}
     for key, bucket in candidates.items():
-        # deterministic ordering for reproducibility
         bucket = sorted(bucket, key=lambda x: (len(x.schemeName), x.schemeName, x.schemeCode))
         for item in bucket:
             try:
@@ -502,6 +608,32 @@ async def update_sync_job(session: AsyncSession, job_id: int, **kwargs: Any) -> 
     await session.flush()
 
 
+async def recalc_job_counts(session: AsyncSession, job_id: int) -> Tuple[int, int]:
+    success_count = (
+        await session.execute(
+            select(func.count()).select_from(FundSyncState).where(
+                FundSyncState.last_job_id == job_id,
+                FundSyncState.sync_state == "SUCCESS",
+            )
+        )
+    ).scalar_one()
+    failed_count = (
+        await session.execute(
+            select(func.count()).select_from(FundSyncState).where(
+                FundSyncState.last_job_id == job_id,
+                FundSyncState.sync_state == "FAILED",
+            )
+        )
+    ).scalar_one()
+    await session.execute(
+        update(SyncJob)
+        .where(SyncJob.id == job_id)
+        .values(processed_funds=success_count, failed_funds=failed_count)
+    )
+    await session.flush()
+    return int(success_count), int(failed_count)
+
+
 async def process_scheme(session: AsyncSession, client: httpx.AsyncClient, code: int, job_id: int) -> None:
     await upsert_sync_state(session, code, sync_state="RUNNING", last_error=None, last_job_id=job_id)
     await update_sync_job(session, job_id, current_fund_code=code)
@@ -514,8 +646,8 @@ async def process_scheme(session: AsyncSession, client: httpx.AsyncClient, code:
     _, category = target_key
 
     fund = await session.get(Fund, code)
-    latest_item = max(data.data, key=lambda x: datetime.strptime(x.date, "%d-%m-%Y")) if data.data else None
-    latest_nav_date = datetime.strptime(latest_item.date, "%d-%m-%Y").date() if latest_item else None
+    latest_item = max(data.data, key=lambda x: parse_ddmmyyyy(x.date)) if data.data else None
+    latest_nav_date = parse_ddmmyyyy(latest_item.date) if latest_item else None
     latest_nav_value = Decimal(latest_item.nav) if latest_item else None
     now_utc = datetime.now(timezone.utc)
 
@@ -540,7 +672,7 @@ async def process_scheme(session: AsyncSession, client: httpx.AsyncClient, code:
     to_insert: List[Dict[str, Any]] = []
     df_data: List[Dict[str, Any]] = []
     for item in data.data:
-        nav_date = datetime.strptime(item.date, "%d-%m-%Y").date()
+        nav_date = parse_ddmmyyyy(item.date)
         nav_val = Decimal(item.nav)
         df_data.append({"date": nav_date, "nav": float(nav_val)})
         if last_stored_date is None or nav_date > last_stored_date:
@@ -687,14 +819,9 @@ async def backfill_pipeline(job_id: Optional[int] = None) -> None:
                     await redis_client.set("sync_current_scheme", str(code))
                     try:
                         await process_scheme(session, client, code, job.id)
-                        await update_sync_job(
-                            session,
-                            job.id,
-                            processed_funds=job.processed_funds + 1,
-                            current_fund_code=code,
-                        )
+                        await recalc_job_counts(session, job.id)
+                        await update_sync_job(session, job.id, current_fund_code=code, status="RUNNING", last_error=None)
                         await session.commit()
-                        await session.refresh(job)
                     except Exception as exc:
                         logger.exception("Failed processing scheme %s", code)
                         existing = await session.get(FundSyncState, code)
@@ -707,17 +834,17 @@ async def backfill_pipeline(job_id: Optional[int] = None) -> None:
                             last_error=str(exc),
                             last_job_id=job.id,
                         )
+                        await recalc_job_counts(session, job.id)
                         await update_sync_job(
                             session,
                             job.id,
-                            failed_funds=job.failed_funds + 1,
                             current_fund_code=code,
                             status="FAILED",
                             last_error=str(exc),
                         )
                         await session.commit()
-                        await session.refresh(job)
 
+                await recalc_job_counts(session, job.id)
                 await update_sync_job(
                     session,
                     job.id,
