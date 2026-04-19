@@ -1451,3 +1451,4 @@ async def get_sync_status() -> Dict[str, Any]:
             "pending_funds": pending_count,
             "last_error": job.last_error,
         }
+
