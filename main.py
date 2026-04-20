@@ -16,6 +16,7 @@ import time
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from contextlib import asynccontextmanager
 
 import httpx
 import numpy as np
@@ -494,7 +495,9 @@ def compute_metrics(df: pd.DataFrame, window_years: int) -> Dict[str, Any]:
     nav_values: np.ndarray = df["nav"].to_numpy(dtype=np.float64)
     timestamps: np.ndarray = df.index.to_numpy()  # numpy datetime64
 
-    window_td = np.timedelta64(int(365.25 * window_years * 24 * 3600), "s")
+    # window_td = np.timedelta64(int(365.25 * window_years * 24 * 3600), "s")
+    target_seconds = int((365.25 * window_years * 24 * 3600) - (2 * 24 * 3600))
+    window_td = np.timedelta64(target_seconds, "s")
 
     rolling_returns: List[float] = []
     rolling_cagrs: List[float] = []
@@ -515,7 +518,7 @@ def compute_metrics(df: pd.DataFrame, window_years: int) -> Dict[str, Any]:
             continue
 
         elapsed_days = max((timestamps[i] - timestamps[j]) / np.timedelta64(1, "D"), 1.0)
-        years = elapsed_days / 365.25
+        years = round(elapsed_days / 365.25, 1)
         total_return = ((current_nav / base_nav) - 1.0) * 100.0
         cagr = (((current_nav / base_nav) ** (1.0 / years)) - 1.0) * 100.0
 
@@ -1229,15 +1232,27 @@ def fund_details_out(fund: Fund) -> FundDetailsOut:
 # FASTAPI APPLICATION
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Mutual Fund Analytics Platform")
+# app = FastAPI(title="Mutual Fund Analytics Platform")
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
+# @app.on_event("startup")
+# async def startup_event() -> None:
+#     async with engine.begin() as conn:
+#         await conn.run_sync(Base.metadata.create_all)
+#     await redis_client.set("sync_status", "idle")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup logic ---
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await redis_client.set("sync_status", "idle")
+    
+    yield  # The app runs while it is yielded
+    
+    # --- Shutdown logic ---
+    # (You can leave this empty or add teardown code here later)
 
+app = FastAPI(title="Mutual Fund Analytics Platform", lifespan=lifespan)
 
 # NOTE: /funds/rank MUST be registered before /funds/{code} so that FastAPI
 # resolves the literal path segment "rank" before attempting integer coercion
